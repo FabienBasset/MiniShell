@@ -1,0 +1,347 @@
+/*
+    Fichier main.c : Contient la boucle du shell et le traitement des commandes
+    Auteurs : Fabien BASSET, Clément PALLUEL
+    Dépendances : Shell_vars.h, Shell_commands.h, tools.h
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+
+#include "Shell_vars.h"
+#include "Shell_commands.h"
+#include "tools.h"
+
+/*
+    Fonction Terminal_Newline
+    Calcul puis affiche une nouvelle ligne dans le shell
+*/
+void Terminal_Newline()
+{
+    char * user = getenv("USER");
+    char * current = getenv("PWD");
+    char * newline = NULL;
+
+    if(strcmp(current,getenv("HOME"))==0)
+    {
+        newline = (char*)malloc((strlen(user)+8)*sizeof(char));
+        sprintf(newline,"%s: ~ $ ",user);
+    }
+    else
+    {
+        newline = (char*)malloc((strlen(user)+strlen(current)+6)*sizeof(char));
+        sprintf(newline,"%s: %s $ ",user,current);
+    }
+    fputs(newline,stdout);
+    free(newline);
+}
+
+/*
+    Fonction Read_Input
+    Retourne un pointeur sur chaine de caractères contenant la ligne saisie par l'utilisateur
+*/
+char * Read_Input()
+{
+    /// Variables
+    int size = 0;
+    char * string_input = NULL;
+    int c;
+
+    /// Saisie
+    while((c = fgetc(stdin))!='\n') /// Tant qu'on saisie qqch dans le terminal
+    {
+        if((string_input = realloc(string_input,++size*sizeof(char)))) /// on agrandi le tableau contenant la chaine saisie
+            string_input[size-1] = c;
+        else /// traitement erreur mémoire
+        {
+            fputs("Too weak memory\n",stderr);
+            exit(-1);
+        }
+    }
+    if((string_input = realloc(string_input,++size*sizeof(char)))) /// on place le caractere de fin de chaine
+        string_input[size-1] = '\0';
+    else /// traitement erreur mémoire
+    {
+        fputs("Too weak memory\n",stderr);
+        exit(-1);
+    }
+    return(string_input);
+}
+
+/*
+    Fonction Command_Is_Shell_API
+    Paramètre shell_args : Variable globale du shell contenant toutes les données comme les variables, les commandes etc.
+    Paramètre command_args : Pointeur sur tableau de chaines permettant de passer les arguments de la commande courante
+    Retourne un entier indiquant l'id de la commande shell ou -1 si la commande n'est pas une commande shell
+*/
+int Command_Is_Shell_API(Shell_Args * shell_args,char ** command_args)
+{
+    int shell_api = -1;
+
+    /// Gestion des variables ///////////////
+    Variables_CommandParser(shell_args, shell_args->vars,command_args);
+    /// /////////////////////////////////////
+
+    if(command_args[0]) ///Si on a entré qqch ...
+    {
+        if(strcmp(command_args[0],"exit")==0) ///liste des commandes reconnues par le shell
+            shell_api = 1;
+        else if(strcmp(command_args[0],"cd")==0)
+            shell_api = 2;
+        else if(strcmp(command_args[0],"export")==0)
+            shell_api = 3;
+        else if(strcmp(command_args[0],"unset")==0)
+            shell_api = 4;
+
+        switch(shell_api) /// on éxécute les actions de chaque commande
+        {
+            case 1: exit_command(shell_args);break;
+            case 2: cd_command(command_args); break;
+            case 3: export_command(command_args,shell_args); break;
+            case 4: unset_command(command_args,shell_args->vars); break;
+        }
+
+    }
+    return(shell_api);
+}
+
+/*
+    Fonction Command_Thread_Process
+    Paramètre data : Variable globale du shell contenant toutes les données comme les variables, les commandes etc.
+    Lance un thread exécutant la ou les commandes saisie(s)
+*/
+void * Command_Thread_Process(void * data)
+{
+    Shell_Args * shell_args = (Shell_Args *)data;
+    int * status = (int*)malloc(sizeof(int));
+
+    /// CALCUL DE NB DE COMMANDES
+    shell_args->n_commands = 0;
+    while(shell_args->commands[shell_args->n_commands])
+        shell_args->n_commands++;
+    /// /////////////////////////
+
+    /// CREATION DES PIPES ///////////////////
+    int i = 0,index_pipe=0;
+    int p[shell_args->n_commands-1];
+    for(i = 0; i < shell_args->n_commands-1; i++){
+        if(pipe(p + i*2) < 0) {
+            perror("Error, Couldn't Pipe !");
+            exit(EXIT_FAILURE);
+        }
+    }
+    /// //////////////////////////////////////
+
+    /// ON EXECUTE TOUTES LES COMMANDES //////////////////////////////
+    pid_t pid;
+    for (i = 0; i < shell_args->n_commands; i++)
+    {
+        char ** args = Cut_String(shell_args->commands[i]," "); /// récupération des arguments de la commande courante
+        if(Command_Is_Shell_API(shell_args,args)==-1)
+        {
+            pid = fork();
+            switch (pid) /// on crée un fils puis on traite les actions possibles
+            {
+                case -1: fputs("Fork error\n",stderr);exit(-2);break; ///cas erreur fork
+                case 0: { /// cas du fils
+                        /// On active le CTRL-C pour le programme éxécuté
+                        signal(SIGINT, SIG_DFL);
+                        if(i < shell_args->n_commands-1) ///On rempli les tubes jusque la n-1 éme commande
+                        {
+                            if(dup2(p[index_pipe + 1], 1) < 0)
+                            {
+                                perror("Pipe Error");
+                                exit(EXIT_FAILURE);
+                            }
+                        }
+                        if(index_pipe != 0 ) ///On redirige la STDOUT vers la sortie des pipes, sauf si on est a la premiere commande
+                        {
+                            if(dup2(p[index_pipe-2], 0) < 0)
+                            {
+                                perror("Pipe Error");
+                                exit(EXIT_FAILURE);
+                            }
+                        }
+                        for(i = 0; i < 2*(shell_args->n_commands-1); i++) ///On ferme les pipes déjà utilisés par les commandes precedentes
+                                close(p[i]);
+
+                        /* test */
+                        int fd1 ;
+                        if ((fd1 = creat("/home/fabien/b" ,O_WRONLY)) < 0) {
+                            perror("Couldn't open the output file");
+                            exit(0);
+                        }
+                        dup2(fd1, STDOUT_FILENO);
+                        close(fd1);
+                        /* **** */
+
+                        execvp(args[0], args);
+                        perror(args[0]);
+                        exit(EXIT_FAILURE);
+                        break;
+                    }
+                default:    index_pipe=index_pipe+2;     break;
+            }
+        }
+    }
+    /// //////////////////////////////////////////////////////////////
+
+    /// On fermer les pipes ///////////////
+    for(i = 0; i < 2 * (shell_args->n_commands-1); i++)
+        close(p[i]);
+    /// ///////////////////////////////////
+
+    /// on attend la fin de dernier processus et on gére le status et l'arriere plan ///
+    waitpid(pid,status,0);
+    if(shell_args->background == 1)
+    {
+        fprintf(stdout,"Process [%d] \"%s\" PID:[%d] terminated with status %d\n",*shell_args->n_backgrounds,shell_args->commands[shell_args->n_commands-1],pid,*status);
+        --*shell_args->n_backgrounds;
+    }
+    while(wait(0)!=-1); /// on attend tous les autres processus
+    Free_2_dimentionnal_array((void**)shell_args->commands);
+    free(shell_args);
+    pthread_exit((void*)status);
+}
+
+/*
+    Fonction Commands_Runner
+    Paramètre shell_args : Variable globale du shell contenant toutes les données comme les variables, les commandes etc.
+    Créé le thread et détermine le type de commande (avant ou arrière plan)
+*/
+void Commands_Runner(Shell_Args * shell_args)
+{
+    /* création de l'argument pour le thread */
+    Shell_Args * thread_args = (Shell_Args*)calloc(sizeof(Shell_Args),1);
+    thread_args->n_commands = shell_args->n_commands;
+    thread_args->commands = NULL;
+    int size = 0;
+    while(shell_args->commands[size])
+    {
+        if(!(thread_args->commands = realloc(thread_args->commands,(size+1)*sizeof(char*))))
+            exit(-1);
+        thread_args->commands[size] = (char*)calloc(sizeof(char),strlen(shell_args->commands[size])+1);
+        strcpy(thread_args->commands[size],shell_args->commands[size]);
+        size++;
+    }
+    if(!(thread_args->commands = realloc(thread_args->commands,(size+1)*sizeof(char*))))
+            exit(-1);
+    thread_args->commands[size] = (char*)calloc(sizeof(char),1);
+    thread_args->commands[size] = NULL;
+    thread_args->vars = shell_args->vars;
+    thread_args->background = shell_args->background;
+    thread_args->n_backgrounds = shell_args->n_backgrounds;
+    thread_args->last_return_value = shell_args->last_return_value;
+    /* ///////////////////////////////////// */
+
+    pthread_t thread;
+    pthread_create (&thread, NULL, &Command_Thread_Process, thread_args);
+    if(shell_args->background==0)
+    {
+        int * status;
+        pthread_join(thread,(void**)&status);
+        *shell_args->last_return_value = *status;
+        free(status);
+    }
+    else
+    {
+        printf("[%d] %s\n",++*shell_args->n_backgrounds,shell_args->commands[size-1]);
+
+    }
+}
+
+/*
+    Fonction Commands_Parser
+    Paramètre shell_args : Variable globale du shell contenant toutes les données comme les variables, les commandes etc.
+    Paramètre meta_command : Pointeur sur chaine représentant la ligne saisie par l'utilisateur
+    Découpe la meta commande et vérifie la syntaxe
+*/
+void Commands_Parser(Shell_Args * shell_args,char * meta_command)
+{
+    int i = 0, j, cursor, k, l; /* ret est le code retour des commandes */
+    char ** commands = Cut_String(meta_command,";"); /// on gére le découpages de chaque commandes
+    while(commands[i]) /// COMMANDES SÉPARÉES PAR ";"
+    {
+        j = 0;
+        char ** commands_orcond = Cut_String(commands[i],"||");
+        while(commands_orcond[j]) /// COMMANDES SEPARÉES PAR "||" (OU LOGIQUE)
+        {
+            k=0;
+            char ** commands_andcond = Cut_String(commands_orcond[j],"&&");
+            while(commands_andcond[k]) /// COMMANDES SEPARÉES PAR "&&" (ET LOGIQUE)
+            {
+                l = cursor = 0;
+                char * tmp = (char *)malloc(sizeof(char)*strlen(commands_andcond[k])+1);
+                strcpy(tmp,commands_andcond[k]);
+                char ** commands_background = Cut_String(tmp,"&");
+                while(commands_background[l]) /// COMMANDES EN ARRIERE PLAN
+                {
+                    if(strlen(commands_background[l]) != strlen(commands_andcond[k]+cursor)) /* si la commande est en arriere plan */
+                    {
+                        if((commands_andcond[k+1]) || (commands_orcond[j+1])) /* et s'il n'y a pas d'autre opérateur suivant la commande */
+                        {
+                            *shell_args->last_return_value = -1;
+                            fprintf(stderr,"Syntaxe error, unexpected \"&\".\n");
+                            break;
+                        }
+                        else
+                            shell_args->background = 1;
+                    }
+                    else
+                        shell_args->background = 0;
+                    cursor = cursor + strlen(commands_background[l]) + 1; /* curseur de parcour de la commande */
+
+                    shell_args->commands = Cut_String(commands_background[l],"|"); /// COMMANDES TUBÉES
+                    Commands_Runner(shell_args); /// on lance les commandes
+                    if(*shell_args->last_return_value!=0)
+                        break;
+                    l++;
+                }
+                if(*shell_args->last_return_value!=0) /* si les commandes tubées ne se sont pas bien passées, on quitte le ET logique */
+                    break;
+                k++;
+            }
+            Free_2_dimentionnal_array((void**)commands_andcond);
+            if(*shell_args->last_return_value == 0) /* si les commandes tubées se sont bien passées, on quitte le OU logique */
+                break;
+            j++;
+
+        }
+        Free_2_dimentionnal_array((void**)commands_orcond);
+        i++;
+    }
+}
+
+
+int main()
+{
+    signal(SIGINT, SIG_IGN); /// On désactive le signal de CTRL-C pour le shell
+    printf("\n      HELLO, %s !\n\n",getenv("USER"));
+
+    ///On initialise la liste des variables essentielles pour le shell
+    Shell_Args * shell_args = (Shell_Args*)malloc(sizeof(Shell_Args));
+    shell_args->vars = Variables_Create(); /* Liste des variables du shell (export, unset) */
+    shell_args->commands = NULL; /* Commande de la ligne saisie */
+    shell_args->n_commands = 0; /* nombre de commandes dans la ligne saisie */
+    shell_args->last_return_value = (int*)malloc(sizeof(int));
+    *shell_args->last_return_value = 0; /* code retour de la dernière commande exécutée */
+    shell_args->background = 0;
+    shell_args->n_backgrounds = (int*)malloc(sizeof(int));
+    *shell_args->n_backgrounds = 0;
+    /// ///////////////////////////////////////////////////////////////
+
+    while(1) /// boucle infinie du shell
+    {
+        Terminal_Newline(); /// On ajoute une ligne
+        char * command = Read_Input(); /// On récupére la commande saisie
+        Commands_Parser(shell_args,command);
+    }
+
+    return(0);
+}
